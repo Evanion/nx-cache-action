@@ -32,13 +32,14 @@ Pin a full commit SHA (`Evanion/nx-cache-action@<40-char sha> # v0.1.0`) or an e
 
 ## Modes
 
-- Default-branch `push`, `workflow_dispatch` and `schedule` runs with `id-token: write` exchange the job's OIDC token at `POST <server>/v1/oidc/github` for a 1-hour write token for the shared cache.
+- `push`, `workflow_dispatch` and `schedule` runs on the default branch, or on a branch the project trusts and GitHub protects, with `id-token: write` exchange the job's OIDC token at `POST <server>/v1/oidc/github` for a 1-hour write token for the shared cache.
+- Before the exchange the action asks `GET <server>/v1/oidc/github/eligibility` (with `read-token`) whether this event and ref may write. The server holds the rules; the action keeps none. A `404` from an older server means the action exchanges and lets the server decide.
 - `pull_request` runs on `refs/pull/<n>/merge` with `id-token: write` get a 1-hour write token confined to the PR's namespace `pr-<n>`. The action prints `mode: write (pr-<n>)`. That token reads the PR namespace and then the shared cache, and writes only the PR namespace.
-- Every other run (`pull_request_target`, other branches, a refused or failed exchange) uses `read-token`. A failed exchange never fails the job.
+- Every other run (`pull_request_target`, untrusted branches, tags, a failed eligibility check, a refused or failed exchange) uses `read-token`. A failure never fails the job.
 
 ## Security model
 
-- The action stores no secrets. It reads `read-token` from the job and asks GitHub for an OIDC token, which the server verifies (repository id, owner id, ref, event) before it mints a write token. Every token is masked in the log.
+- The action stores no secrets. It reads `read-token` from the job and asks GitHub for an OIDC token, which the server verifies (repository id, owner id, ref, ref type, event) before it mints a write token. The eligibility answer only decides whether the action asks; the exchange checks the signed claims again. Every token is masked in the log.
 - No token appears in a process argument list: headers and bodies go to `curl` through stdin.
 - In write mode the action starts `gateway.mjs` on `127.0.0.1` and points Nx at it. The gateway forwards each request to the server with the `Authorization` header Nx sends and holds no token of its own; it starts with the read token and the OIDC request token removed from its environment. For a `PUT` over `large-upload-threshold` it asks the server for an upload slot, sends the body to the presigned object storage URL the server returns, and confirms the upload. This gets artifacts past Cloudflare's 100 MB request body limit.
 - When a large upload fails, the gateway answers Nx `403`, which Nx ignores, and the task is not cached. The post step stops the gateway and copies each "not cached" line into the job summary as a warning.

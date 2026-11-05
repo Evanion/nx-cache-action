@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Exports the Nx remote cache env vars to $GITHUB_ENV.
 # Run by main.mjs. Inputs (env): INPUT_SERVER, INPUT_READ_TOKEN. Uses a 1-hour write token from the
-# server's GitHub OIDC exchange when the job has an OIDC token, else the read token.
+# server's GitHub OIDC exchange when the job has an OIDC token and the server
+# says the run may write, else the read token.
 # A pull_request run's write token is confined to that PR's namespace (pr-<n>).
 # In write mode it starts gateway.mjs on 127.0.0.1 and points Nx at it, so an
 # artifact over Cloudflare's 100 MB body limit goes straight to R2.
@@ -11,7 +12,6 @@ set -euo pipefail
 TOKEN_RE='^nxc_[A-Za-z0-9_-]{43}$'
 JWT_RE='^[A-Za-z0-9._-]+$'
 NAMESPACE_RE='^pr-[1-9][0-9]{0,9}$'
-PR_REF_RE='^refs/pull/[1-9][0-9]{0,9}/merge$'
 SERVER_RE='^(https://[A-Za-z0-9.-]+|http://(localhost|127\.0\.0\.1))(:[0-9]+)?$'
 
 server="${INPUT_SERVER:-}"
@@ -92,24 +92,38 @@ exchange() {
   echo "::add-mask::$new_token"
 }
 
-# The server mints shared write tokens for these events on the default branch,
-# and namespaced ones for pull_request runs on refs/pull/<n>/merge (never
-# pull_request_target). Skipping the exchange elsewhere keeps refused attempts
-# out of its audit log.
+# Asks the server whether this run would get a write token: the shared cache
+# for push, workflow_dispatch and schedule runs on the default branch or a
+# branch the project trusts, the PR namespace for pull_request runs on
+# refs/pull/<n>/merge. The rule lives only on the server; asking first keeps
+# routine refusals out of its audit log. A server without the check (404)
+# gets the exchange, which decides the same way.
+uri() { jq -rn --arg v "$1" '$v | @uri'; }
+
 eligible() {
-  case "${GITHUB_EVENT_NAME:-}" in
-  push | workflow_dispatch | schedule) ;;
-  pull_request)
-    [[ "${GITHUB_REF:-}" =~ $PR_REF_RE ]]
-    return
+  local resp code body answer
+  # The read token goes through stdin so it never appears in a process argv.
+  resp="$(printf 'Authorization: Bearer %s\n' "$read_token" |
+    curl -s --max-time 15 -w '\n%{http_code}' -H @- \
+      "$server/v1/oidc/github/eligibility?event=$(uri "${GITHUB_EVENT_NAME:-}")&ref=$(uri "${GITHUB_REF:-}")&ref_type=$(uri "${GITHUB_REF_TYPE:-}")")" || {
+    echo "OIDC: eligibility check failed"
+    return 1
+  }
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  case "$code" in
+  200) ;;
+  404) return 0 ;;
+  *)
+    echo "OIDC: eligibility check failed (HTTP $code)"
+    return 1
     ;;
-  *) return 1 ;;
   esac
-  local default_branch=""
-  if [[ -r "${GITHUB_EVENT_PATH:-}" ]]; then
-    default_branch="$(jq -r '.repository.default_branch // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+  answer="$(jq -r 'if .eligible == true then "yes" else "no" end' <<<"$body" 2>/dev/null || echo no)"
+  if [[ "$answer" != "yes" ]]; then
+    echo "OIDC: this ${GITHUB_EVENT_NAME:-} run on ${GITHUB_REF:-} is not trusted for writes"
+    return 1
   fi
-  [[ -z "$default_branch" || "${GITHUB_REF:-}" == "refs/heads/$default_branch" ]]
 }
 
 new_token=""
