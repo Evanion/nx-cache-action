@@ -1,0 +1,17 @@
+name: Nx self-hosted cache setup
+description: Configures the Nx remote cache. Default-branch pushes get a 1-hour write token through GitHub OIDC, same-repo pull requests get one confined to their own PR namespace, everything else gets the read token.
+inputs:
+  server:
+    description: Cache server origin, for example vars.NX_SELF_HOSTED_REMOTE_CACHE_SERVER.
+    required: true
+  read-token:
+    description: Project read token (secret NX_CACHE_READ_TOKEN). If empty, the remote cache is disabled for the run.
+    required: true
+  large-upload-threshold:
+    description: Bytes. In write mode a cache upload over this goes through a local gateway straight to R2, since Cloudflare refuses request bodies over 100 MB.
+    required: false
+    default: '99614720'
+runs:
+  using: node24
+  main: main.mjs
+  post: post.mjs
